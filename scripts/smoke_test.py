@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -14,6 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.detection import analyze_series  # noqa: E402
+from app.lag_correlation import (  # noqa: E402
+    _match_pairs,
+    _select_best_lag,
+    scan_lag_correlation,
+)
 from app.main import app  # noqa: E402
 from app.trends import _mann_kendall, scan_trends  # noqa: E402
 
@@ -396,6 +402,118 @@ def test_trend_min_slope_filter() -> None:
     print("✓ min_slope 过滤：斜率不达标的显著 p 值窗口不判趋势")
 
 
+def test_lag_correlation_perfect_lag() -> None:
+    """正时滞 + 线性响应：driver 提前 600 秒，最佳 lag=600 且 r=1。"""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 21, 0, 0, 0, tzinfo=timezone.utc)
+    dts = [(base + timedelta(seconds=100 * i)).isoformat() for i in range(11)]
+    dvs = [float(i) for i in range(11)]
+    rts = [(base + timedelta(seconds=600 + 100 * i)).isoformat() for i in range(11)]
+    rvs = [2.0 * i + 3.0 for i in range(11)]
+
+    result = scan_lag_correlation(dts, dvs, rts, rvs, [-600.0, 0.0, 300.0, 600.0], 10.0, 3)
+    by_lag = {c["lag_seconds"]: c for c in result["candidates"]}
+    assert [c["lag_seconds"] for c in result["candidates"]] == [-600.0, 0.0, 300.0, 600.0]
+    assert by_lag[600.0]["pair_count"] == 11
+    assert by_lag[600.0]["correlation"] == 1.0
+    assert by_lag[600.0]["usable"] is True and by_lag[600.0]["reason"] is None
+    assert by_lag[-600.0]["pair_count"] == 0
+    assert by_lag[-600.0]["usable"] is False and "min_pairs" in by_lag[-600.0]["reason"]
+    assert result["best_lag_seconds"] == 600.0
+    assert result["driver_point_count"] == 11 and result["response_point_count"] == 11
+    print("✓ 时滞关联：完美时滞 + 仿射响应下 best_lag=600、r=1，候选按 lag 升序")
+
+
+def test_lag_matching_ties_and_no_reuse() -> None:
+    """一对一最近邻：等距取更早 response、已匹配 response 不得复用、按 driver 时间贪心。"""
+    # 等距（target 恰在两个 response 正中）取更早 response
+    assert _match_pairs([10.0], [100.0], [5.0, 15.0], [50.0, 150.0], 0.0, 5.0) == [
+        (100.0, 50.0)
+    ]
+    # 更早的 driver 先占用唯一 response，后续 driver 不得复用
+    assert _match_pairs([9.0, 10.0], [90.0, 100.0], [10.0], [10.0], 0.0, 1.0) == [
+        (90.0, 10.0)
+    ]
+    # tie 取更早 response 后，后一个 driver 才能匹配到较晚 response（对比：取较晚会丢第二对）
+    assert _match_pairs(
+        [10.0, 15.0], [1.0, 2.0], [5.0, 15.0], [10.0, 20.0], 0.0, 5.0
+    ) == [(1.0, 10.0), (2.0, 20.0)]
+    # 容差为闭区间：距离恰好等于容差仍可配对
+    assert _match_pairs([0.0], [1.0], [3.0], [2.0], 0.0, 3.0) == [(1.0, 2.0)]
+    assert _match_pairs([0.0], [1.0], [3.0001], [2.0], 0.0, 3.0) == []
+    # 正负 lag 平移
+    assert _match_pairs([0.0], [1.0], [100.0], [7.0], 100.0, 0.0) == [(1.0, 7.0)]
+    assert _match_pairs([100.0], [1.0], [0.0], [7.0], -100.0, 0.0) == [(1.0, 7.0)]
+    print("✓ 时滞匹配：等距取更早、不得复用、按时间贪心、容差闭区间与正负 lag 正确")
+
+
+def test_lag_correlation_unusable_reasons() -> None:
+    """候选不可用原因：配对不足、driver/response 侧方差为零；无可用时 best 为 null。"""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 21, 1, 0, 0, tzinfo=timezone.utc)
+    ts = [(base + timedelta(seconds=100 * i)).isoformat() for i in range(4)]
+
+    r_const = scan_lag_correlation(ts, [1.0, 2.0, 3.0, 4.0], ts, [5.0] * 4, [0.0], 1.0, 3)
+    c = r_const["candidates"][0]
+    assert c["usable"] is False and c["correlation"] is None and c["pair_count"] == 4
+    assert "response 侧" in c["reason"]
+
+    d_const = scan_lag_correlation(ts, [5.0] * 4, ts, [1.0, 2.0, 3.0, 4.0], [0.0], 1.0, 3)
+    assert "driver 侧" in d_const["candidates"][0]["reason"]
+
+    rts_far = [(base + timedelta(seconds=10000 + 100 * i)).isoformat() for i in range(4)]
+    few = scan_lag_correlation(ts, [1.0, 2.0, 3.0, 4.0], rts_far, [1.0, 2.0, 3.0, 4.0], [0.0], 1.0, 3)
+    assert few["candidates"][0]["usable"] is False
+    assert few["candidates"][0]["pair_count"] == 0 and "min_pairs" in few["candidates"][0]["reason"]
+    assert few["best_lag_seconds"] is None
+    print("✓ 时滞关联：配对不足 / 两侧方差为零原因明确，无可用候选时 best_lag=null")
+
+
+def test_lag_best_tiebreakers() -> None:
+    """best_lag 决胜链：|r|→配对数→|lag|→lag，逐级验证。"""
+
+    def cand(lag: float, r: float, pairs: int) -> dict:
+        return {
+            "lag_seconds": lag,
+            "pair_count": pairs,
+            "correlation": r,
+            "usable": True,
+            "reason": None,
+        }
+
+    # 1) |correlation| 更大优先（负相关 -0.9 胜正相关 0.5）
+    assert _select_best_lag([cand(0.0, 0.5, 8), cand(10.0, -0.9, 3)]) == 10.0
+    # 2) |r| 相同：配对数更多
+    assert _select_best_lag([cand(0.0, 1.0, 4), cand(100.0, 1.0, 3)]) == 0.0
+    # 3) |r|、配对数相同：|lag| 更小
+    assert _select_best_lag([cand(200.0, 1.0, 3), cand(-100.0, 1.0, 3)]) == -100.0
+    # 4) 全部相同：lag 更小
+    assert _select_best_lag([cand(100.0, 1.0, 3), cand(-100.0, 1.0, 3)]) == -100.0
+    # 不可用候选不参与（correlation=None）
+    unusable = {"lag_seconds": 0.0, "pair_count": 0, "correlation": None, "usable": False, "reason": "x"}
+    assert _select_best_lag([unusable, cand(50.0, 0.3, 2)]) == 50.0
+    assert _select_best_lag([unusable]) is None
+    print("✓ best_lag 决胜：|correlation|→配对数→|lag|→lag 四级顺序正确")
+
+
+def test_lag_correlation_negative_correlation() -> None:
+    """负相关同样按 |r| 选中：完全反相序列 r=-1。"""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 21, 2, 0, 0, tzinfo=timezone.utc)
+    ts = [(base + timedelta(seconds=60 * i)).isoformat() for i in range(6)]
+    result = scan_lag_correlation(
+        ts, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        ts, [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+        [0.0, 60.0], 5.0, 3,
+    )
+    assert result["candidates"][0]["correlation"] == -1.0
+    assert result["best_lag_seconds"] == 0.0  # 0 秒 6 对胜过 60 秒 5 对
+    print("✓ 时滞关联：负相关 r=-1 正常计算并参与 |r| 决胜")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -623,7 +741,115 @@ def _exercise_api(client: "TestClient") -> None:
     assert r.status_code == 422
     assert "重复时间戳" in r.text
 
-    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / 趋势扫描")
+    # 时滞关联：driver 提前 600 秒线性驱动 response
+    lag_driver = [
+        {"timestamp": (base + timedelta(seconds=100 * i)).isoformat(), "value": float(i)}
+        for i in range(8)
+    ]
+    lag_response = [
+        {"timestamp": (base + timedelta(seconds=600 + 100 * i)).isoformat(), "value": 2.0 * i + 1.0}
+        for i in range(8)
+    ]
+    lag_payload = {
+        "driver_points": lag_driver,
+        "response_points": lag_response,
+        "lag_seconds": [-600, 0, 300, 600, 1200],
+        "match_tolerance_seconds": 10,
+        "min_pairs": 3,
+    }
+    r = client.post("/api/v1/lag-correlation", json=lag_payload)
+    assert r.status_code == 200, r.text
+    lb = r.json()
+    assert lb["driver_point_count"] == 8 and lb["response_point_count"] == 8
+    assert lb["candidate_lag_count"] == 5 and lb["min_pairs"] == 3
+    assert [c["lag_seconds"] for c in lb["candidates"]] == [-600.0, 0.0, 300.0, 600.0, 1200.0]
+    by_lag = {c["lag_seconds"]: c for c in lb["candidates"]}
+    assert by_lag[600.0]["pair_count"] == 8
+    assert by_lag[600.0]["correlation"] == 1.0
+    assert by_lag[600.0]["usable"] is True and by_lag[600.0]["reason"] is None
+    # lag=300 平移后 driver 后 5 点与 response 前 5 点重合（5 对、线性、可用）；
+    # lag=±600 偏差方向不同：-600 无重合，0/1200 各 2 对低于 min_pairs
+    assert by_lag[300.0]["pair_count"] == 5 and by_lag[300.0]["usable"] is True
+    assert by_lag[-600.0]["usable"] is False
+    assert by_lag[-600.0]["correlation"] is None and "min_pairs" in by_lag[-600.0]["reason"]
+    assert lb["best_lag_seconds"] == 600.0  # 同为 r=1，8 对胜过 5 对
+    assert {"lag_seconds", "pair_count", "correlation", "usable", "reason"} <= set(lb["candidates"][0])
+
+    # 常量 response：配对足够但方差为零，候选不可用且 best 为 null
+    const_payload = {
+        "driver_points": lag_driver,
+        "response_points": [
+            {"timestamp": (base + timedelta(seconds=100 * i)).isoformat(), "value": 7.0}
+            for i in range(8)
+        ],
+        "lag_seconds": [0],
+        "match_tolerance_seconds": 10,
+        "min_pairs": 3,
+    }
+    r = client.post("/api/v1/lag-correlation", json=const_payload)
+    assert r.status_code == 200, r.text
+    cb = r.json()
+    assert cb["candidates"][0]["usable"] is False
+    assert cb["candidates"][0]["correlation"] is None
+    assert "方差为零" in cb["candidates"][0]["reason"]
+    assert cb["best_lag_seconds"] is None
+
+    # 输入无需预排序；时间戳同时支持 ISO 字符串与 epoch 数字
+    unordered = {
+        "driver_points": list(reversed(lag_driver)),
+        "response_points": [
+            {"timestamp": int((base + timedelta(seconds=600 + 100 * i)).timestamp()),
+             "value": 2.0 * i + 1.0}
+            for i in range(8)
+        ],
+        "lag_seconds": [600],
+        "match_tolerance_seconds": 10,
+        "min_pairs": 3,
+    }
+    r = client.post("/api/v1/lag-correlation", json=unordered)
+    assert r.status_code == 200, r.text
+    assert r.json()["best_lag_seconds"] == 600.0
+
+    # 参数校验：空序列 / lag 列表为空 / lag 重复或为 NaN / 负容差 / min_pairs<2
+    bad = dict(lag_payload)
+    bad["driver_points"] = []
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    bad = dict(lag_payload)
+    bad["response_points"] = lag_response[:0]
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    bad = dict(lag_payload)
+    bad["lag_seconds"] = []
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    bad = dict(lag_payload)
+    bad["lag_seconds"] = [0, 0]
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    # lag 含 NaN / Infinity（非合法 JSON 数值）：直接以原始请求体发送，
+    # 服务端解析后由 Pydantic 拒绝（错误响应只回显原始字符串，不二次序列化浮点）
+    base_body = json.dumps({k: v for k, v in lag_payload.items() if k != "lag_seconds"})
+    for bad_token in ("NaN", "Infinity", "-Infinity"):
+        r = client.post(
+            "/api/v1/lag-correlation",
+            content=base_body[:-1] + f', "lag_seconds": [0, {bad_token}]}}}}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 422, (bad_token, r.status_code, r.text)
+    bad = dict(lag_payload)
+    bad["match_tolerance_seconds"] = -1
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    bad = dict(lag_payload)
+    bad["min_pairs"] = 1
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    # min_pairs 超过上限同样 422
+    bad = dict(lag_payload)
+    bad["min_pairs"] = 100_001
+    assert client.post("/api/v1/lag-correlation", json=bad).status_code == 422
+    # 单侧序列内部重复时间戳
+    bad = dict(lag_payload)
+    bad["driver_points"] = lag_driver + [lag_driver[0]]
+    r = client.post("/api/v1/lag-correlation", json=bad)
+    assert r.status_code == 422 and "重复时间戳" in r.text
+
+    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略 / 趋势扫描 / 时滞关联")
 
 
 if __name__ == "__main__":
@@ -642,5 +868,10 @@ if __name__ == "__main__":
     test_trend_direction_switch()
     test_trend_merge_adjacent_and_gap()
     test_trend_min_slope_filter()
+    test_lag_correlation_perfect_lag()
+    test_lag_matching_ties_and_no_reuse()
+    test_lag_correlation_unusable_reasons()
+    test_lag_best_tiebreakers()
+    test_lag_correlation_negative_correlation()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")

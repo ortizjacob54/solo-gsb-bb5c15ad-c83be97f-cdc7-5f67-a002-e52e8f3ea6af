@@ -175,6 +175,81 @@ class TrendRequest(BaseModel):
         return self
 
 
+class LagCorrelationRequest(BaseModel):
+    """双序列时滞关联扫描请求。"""
+
+    driver_points: list[PointIn] = Field(
+        min_length=1, description="驱动序列观测点（时间戳 + 数值），无需预先排序"
+    )
+    response_points: list[PointIn] = Field(
+        min_length=1, description="响应序列观测点（时间戳 + 数值），无需预先排序"
+    )
+    lag_seconds: list[float] = Field(
+        min_length=1,
+        description=(
+            "候选时滞（秒）列表：对每个 lag 把 driver 时间平移 +lag 后与 response "
+            "做一对一最近邻匹配；正值表示 driver 提前 lag 秒作用于 response，"
+            "须为有限数值且互不相同"
+        ),
+    )
+    match_tolerance_seconds: float = Field(
+        ge=0,
+        description=(
+            "配对容差（秒，≥0）：|t_response − (t_driver + lag)| 不超过该值才允许配对"
+        ),
+    )
+    min_pairs: int = Field(
+        default=3,
+        ge=2,
+        le=100_000,
+        description="计算 Pearson 相关所需的最少配对数（≥2）；不足的候选标记为不可用",
+    )
+
+    @field_validator("lag_seconds")
+    @classmethod
+    def _check_lags(cls, v: list[float]) -> list[float]:
+        for lag in v:
+            if not math.isfinite(lag):
+                raise ValueError("lag_seconds 必须全部为有限数值（不接受 NaN/Infinity）")
+        if len(set(v)) != len(v):
+            raise ValueError("lag_seconds 不得包含重复值")
+        return v
+
+
+class LagCandidate(BaseModel):
+    """单个候选时滞的匹配与相关结果。"""
+
+    lag_seconds: float = Field(description="候选时滞（秒）")
+    pair_count: int = Field(description="一对一最近邻匹配得到的配对数")
+    correlation: float | None = Field(
+        default=None, description="Pearson 相关系数；候选不可用时为 null"
+    )
+    usable: bool = Field(description="是否可用：配对数达标且两侧方差均非零")
+    reason: str | None = Field(
+        default=None, description="不可用原因；可用时为 null"
+    )
+
+
+class LagCorrelationResponse(BaseModel):
+    driver_point_count: int
+    response_point_count: int
+    candidate_lag_count: int = Field(description="实际评估的候选时滞数（=请求 lag 数）")
+    match_tolerance_seconds: float
+    min_pairs: int
+    candidates: list[LagCandidate] = Field(
+        description="各候选时滞结果，按 lag_seconds 升序"
+    )
+    best_lag_seconds: float | None = Field(
+        default=None,
+        description=(
+            "最佳时滞（秒）：可用候选中按 |correlation| 最大、配对数更多、"
+            "|lag| 更小、lag 更小依次决出；无可用候选时为 null"
+        ),
+    )
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class TrendWindow(BaseModel):
     """单个滑动窗口的趋势检验结果。"""
 
