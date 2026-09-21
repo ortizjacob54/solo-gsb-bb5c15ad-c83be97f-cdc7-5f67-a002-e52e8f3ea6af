@@ -1,0 +1,156 @@
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描接口。"""
+
+from __future__ import annotations
+
+import uuid
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Query
+
+from . import database
+from .detection import analyze_series
+from .models import (
+    DetectRequest,
+    DetectResponse,
+    DetectionListResponse,
+    HealthResponse,
+    TrendRequest,
+    TrendResponse,
+    parse_timestamp,
+)
+from .trends import scan_trends
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> None:
+    database.init_db()
+    yield
+
+
+app = FastAPI(
+    title="时间序列异常检测与趋势扫描 API",
+    description=(
+        "接收带时间戳的数值序列：异常检测基于稳健滑动窗口（中位数 + MAD）识别突变，"
+        "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
+        "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间。"
+    ),
+    version="1.1.0",
+    lifespan=lifespan,
+)
+
+
+def _prepare_series(points: list) -> tuple[list[str], list[float]]:
+    """解析时间戳，按时间排序并检查重复。"""
+    parsed = []
+    for p in points:
+        dt = parse_timestamp(p.timestamp)
+        parsed.append((dt, p.value))
+    parsed.sort(key=lambda item: item[0])
+
+    timestamps: list[str] = []
+    values: list[float] = []
+    for dt, value in parsed:
+        iso = dt.isoformat()
+        if timestamps and iso == timestamps[-1]:
+            raise HTTPException(status_code=422, detail=f"存在重复时间戳: {iso}")
+        timestamps.append(iso)
+        values.append(value)
+    return timestamps, values
+
+
+def _strip_points(result: dict) -> dict:
+    return {k: v for k, v in result.items() if k != "points"}
+
+
+@app.post("/api/v1/detections", response_model=DetectResponse, status_code=201, tags=["检测"])
+def create_detection(req: DetectRequest) -> dict:
+    """提交序列进行异常检测，结果持久化后返回（含检测 ID）。"""
+    timestamps, values = _prepare_series(req.points)
+
+    result = analyze_series(
+        timestamps=timestamps,
+        values=values,
+        window_size=req.window_size,
+        min_window=req.min_window,
+        threshold=req.threshold,
+        merge_gap=req.merge_gap,
+        baseline_policy=req.baseline_policy,
+        rebase_after=req.rebase_after,
+        gap_reset_factor=req.gap_reset_factor,
+    )
+
+    detection_id = uuid.uuid4().hex
+    request_params = {
+        "window_size": req.window_size,
+        "min_window": req.min_window,
+        "threshold": req.threshold,
+        "merge_gap": req.merge_gap,
+        "baseline_policy": req.baseline_policy,
+        "rebase_after": req.rebase_after,
+        "gap_reset_factor": req.gap_reset_factor,
+        "point_count": len(req.points),
+    }
+    created_at = database.insert_detection(detection_id, req.series_id, request_params, result)
+
+    body = {"id": detection_id, "series_id": req.series_id, "created_at": created_at, **result}
+    if not req.include_points:
+        body = {k: v for k, v in body.items() if k != "points"}
+    return body
+
+
+@app.get("/api/v1/detections/{detection_id}", response_model=DetectResponse, tags=["检测"])
+def get_detection(
+    detection_id: str,
+    include_points: bool = Query(
+        default=True, description="是否返回逐点注解（区间、基线、分数始终返回）"
+    ),
+) -> dict:
+    """按 ID 查询历史检测结果。"""
+    record = database.get_detection(detection_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"检测结果不存在: {detection_id}")
+    result = record["result"]
+    if not include_points:
+        result = _strip_points(result)
+    return {
+        "id": record["id"],
+        "series_id": record["series_id"],
+        "created_at": record["created_at"],
+        **result,
+    }
+
+
+@app.get("/api/v1/detections", response_model=DetectionListResponse, tags=["检测"])
+def list_detections(
+    series_id: str | None = Query(default=None, description="按业务序列 ID 过滤"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    """列出历史检测（摘要信息），可按 series_id 过滤。"""
+    items, total = database.list_detections(series_id=series_id, limit=limit, offset=offset)
+    return {"items": items, "total": total}
+
+
+@app.post("/api/v1/trends", response_model=TrendResponse, tags=["趋势"])
+def create_trend_scan(req: TrendRequest) -> dict:
+    """趋势扫描：滑窗 Mann-Kendall + Theil-Sen，合并显著趋势区间（无状态，不入库）。"""
+    timestamps, values = _prepare_series(req.points)
+
+    result = scan_trends(
+        timestamps=timestamps,
+        values=values,
+        window_size=req.window_size,
+        step_size=req.step_size,
+        alpha=req.alpha,
+        min_slope=req.min_slope,
+    )
+
+    body = {"series_id": req.series_id, **result}
+    if not req.include_windows:
+        body = {k: v for k, v in body.items() if k != "windows"}
+    return body
+
+
+@app.get("/health", response_model=HealthResponse, tags=["系统"])
+def health() -> dict:
+    return {"status": "ok", "database": database.DB_PATH}
