@@ -1,8 +1,8 @@
 # 时间序列异常检测与趋势扫描 API
 
-基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测与趋势扫描服务。
+基于 **Python + FastAPI + SQLite** 的时间序列突变（spike / 水平偏移）检测、趋势扫描与双序列时滞关联扫描服务。
 
-接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。
+接收带时间戳的数值序列，使用**稳健滑动窗口**（中位数 + MAD）逐点评分，识别突变点并把相邻异常合并为异常区间，返回每段的基线、分数以及触发点的自然语言解释；检测结果持久化到 SQLite，支持按 ID / series_id 查询。趋势扫描接口以滑窗 **Mann-Kendall 检验 + Theil-Sen 斜率**识别显著上升 / 下降趋势区间（无状态，不入库）。时滞关联扫描接口对 **driver / response 双序列**按候选时滞平移并做**一对一最近邻匹配**，以 **Pearson 相关系数**评估各时滞下的关联强度并选出 `best_lag`（无状态，不入库）。
 
 ## 特性
 
@@ -14,6 +14,7 @@
 - **区间合并**：相邻触发点间隔不超过 `merge_gap + 1` 个点时合并为一个异常区间（能把一次持续数点的水平偏移归为一段；guarded 重建不参与区间拆分）。
 - **采样断档感知 `gap_reset_factor`**（可选，默认关闭）：以排序后相邻点**正时间差的中位数**估算常规采样间隔，相邻间隔超过 `gap_reset_factor` 倍即判定为断档并切分采样分段。每个分段独立执行 `min_window` 预热，rolling/guarded 的基线、guarded 的连续异常计数与重建代次都在分段起点从头开始，异常区间**绝不跨越断档合并**。响应返回断档边界、估算间隔与逐点 / 逐区间的分段编号；断档后即使水位整体迁移，也不会拿断档前的旧基线误报。
 - **趋势扫描**：以 `window_size` / `step_size` 滑窗，每窗执行含**重复值方差修正**与**连续性校正**的 Mann-Kendall 检验，并按**实际时间差**计算 Theil-Sen 斜率（值/秒，非等距采样同样适用）；仅当 `p_value ≤ alpha` 且 `|slope| ≥ min_slope` 时标记上升 / 下降趋势；方向相同、时间范围重叠或首尾相接的显著窗口自动合并为趋势区间，返回区间范围、成员窗口、最小 p 值与成员斜率中位数。
+- **时滞关联扫描**：对 driver / response 双序列，按候选 `lag_seconds` 逐个把 driver 时间平移 `+lag`，再按时间顺序做**贪心一对一最近邻匹配**（容差 `match_tolerance_seconds` 内取最近点，等距取较早 response，已匹配点不复用）；仅对**配对数 ≥ min_pairs 且两侧方差非零**的候选计算 Pearson 相关系数，逐候选返回配对数、相关系数、可用状态与不可用原因；`best_lag` 按 |correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小依次确定，无可用候选时为 `null`。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
 - **接口文档**：启动后访问 Swagger UI `/docs`、ReDoc `/redoc`。
@@ -24,16 +25,18 @@
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py        # FastAPI 路由与入参校验
-│   ├── detection.py   # 滑动窗口稳健异常检测核心算法
-│   ├── trends.py      # 滑窗 Mann-Kendall + Theil-Sen 趋势扫描
-│   ├── models.py      # Pydantic 请求/响应模型、时间戳解析
-│   └── database.py    # SQLite 存储层
+│   ├── main.py             # FastAPI 路由与入参校验
+│   ├── detection.py        # 滑动窗口稳健异常检测核心算法
+│   ├── trends.py           # 滑窗 Mann-Kendall + Theil-Sen 趋势扫描
+│   ├── lag_correlation.py  # 双序列时滞关联扫描（平移 + 一对一匹配 + Pearson）
+│   ├── models.py           # Pydantic 请求/响应模型、时间戳解析
+│   └── database.py         # SQLite 存储层
 ├── examples/
-│   ├── request.json          # rolling 示例请求（含一次上升突变与一次下降突变）
-│   ├── request_guarded.json  # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
-│   ├── request_gap.json      # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
-│   └── request_trends.json   # 趋势扫描示例请求（先升后降，方向切换）
+│   ├── request.json                # rolling 示例请求（含一次上升突变与一次下降突变）
+│   ├── request_guarded.json        # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
+│   ├── request_gap.json            # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
+│   ├── request_trends.json         # 趋势扫描示例请求（先升后降，方向切换）
+│   └── request_lag_correlation.json # 时滞关联示例请求（response 滞后 driver 600 秒）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -62,6 +65,9 @@ curl -X POST http://localhost:8000/api/v1/detections \
 curl -X POST http://localhost:8000/api/v1/trends \
   -H "Content-Type: application/json" \
   -d @examples/request_trends.json
+curl -X POST http://localhost:8000/api/v1/lag-correlation \
+  -H "Content-Type: application/json" \
+  -d @examples/request_lag_correlation.json
 ```
 
 ### 方式二：本地 Python 运行
@@ -129,6 +135,28 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 - `segments[]`：合并后的趋势区间，含 `direction`（上升 / 下降）、`start/end_index`、`start/end_time`、`window_count`、`min_p_value`（成员窗口最小 p 值）、`median_slope`（成员窗口斜率中位数，值/秒）与成员窗口明细 `windows[]`；
 - 每个窗口对象含 `s`（Mann-Kendall S 统计量）、`var_s`（重复值修正后的方差）、`z`（连续性校正后 Z 值）、`p_value`（双侧）、`slope`（值/秒）、`significant` 与 `direction`（上升 / 下降 / 平稳）；
 - `windows`：全部评估窗口（仅 `include_windows=true` 时返回，否则为 `null`）。
+
+### `POST /api/v1/lag-correlation` — 双序列时滞关联扫描
+
+对 driver / response 两条序列评估一组候选时滞：每个候选 `lag` 先把 driver 时间平移 `+lag`（lag > 0 表示 driver 的变化在 lag 秒后才体现到 response 上），再按时间顺序做**贪心一对一最近邻匹配**——每个平移后的 driver 点在**未匹配**的 response 点中取时间距离最近且不超过 `match_tolerance_seconds` 者配对，容差内左右等距时取**较早**的 response，已匹配的 response 点不得复用。仅对**配对数 ≥ min_pairs 且两侧配对值方差都非零**的候选计算 Pearson 相关系数。**无状态接口，结果不入库。**
+
+请求体：
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `driver_points` | `[{timestamp, value}]` | 必填（≥1） | 驱动侧序列；时间戳格式与检测接口一致，无需预先排序，服务端自动排序并拒绝重复时间戳（422） |
+| `response_points` | `[{timestamp, value}]` | 必填（≥1） | 响应侧序列；要求同 `driver_points` |
+| `lag_seconds` | `[float]` | 必填（≥1 个） | 候选时滞（秒，可为负，必须有限）；逐个评估并按请求顺序返回结果 |
+| `match_tolerance_seconds` | float | 必填 | 匹配容差（秒，≥0 且有限）：平移后两侧时间差不超过该值才允许配对 |
+| `min_pairs` | int | 3 | 计算 Pearson 相关所需的最少配对数（≥2）；配对数不足时该候选不可用 |
+
+约束：`lag_seconds` 至少 1 个且元素为有限数值；`match_tolerance_seconds ≥ 0` 且有限；`min_pairs ≥ 2`；两条序列各自时间戳不得重复。违反任一约束返回 422。
+
+响应（节选）：
+
+- 摘要：`driver_point_count`、`response_point_count`、`match_tolerance_seconds`、`min_pairs` 回显，以及 `candidate_count`（候选总数）与 `usable_candidate_count`（可用候选数）；
+- `candidates[]`：按请求顺序逐候选返回 `lag_seconds`、`pair_count`（一对一匹配得到的配对数）、`correlation`（Pearson 相关系数，不可用时为 `null`）、`usable`（可用状态）与 `reason`（不可用原因，可用时为 `null`）；
+- `best_lag`：可用候选中按 **|correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小**依次确定的最优时滞（秒）；无可用候选时为 `null`。
 
 ### `GET /health` — 健康检查
 
@@ -231,6 +259,40 @@ curl -s -X POST http://localhost:8000/api/v1/trends \
 ```
 
 注意斜率单位为**值/秒**：示例中 5 分钟上升 0.25，即 `0.25 / 300 ≈ 8.33e-4`，因此 `min_slope` 取 `0.0005` 可以通过、取 `0.001` 则整段不判趋势。非等距采样时斜率仍按实际时间差计算。
+
+### 时滞关联扫描（driver → response）
+
+```bash
+# driver 20 个点（5 分钟间隔）；response 22 个点、整体滞后 driver 600 秒
+# 且采样时刻偏移 1 分钟（验证容差匹配）。候选时滞 -300~900 秒、容差 120 秒：
+# lag=600 时 20 个 driver 全部配对，Pearson 相关 ≈ 0.9996，成为 best_lag。
+curl -s -X POST http://localhost:8000/api/v1/lag-correlation \
+  -H "Content-Type: application/json" \
+  -d @examples/request_lag_correlation.json | python -m json.tool
+```
+
+响应（节选）：
+
+```json
+{
+  "driver_point_count": 20,
+  "response_point_count": 22,
+  "match_tolerance_seconds": 120.0,
+  "min_pairs": 3,
+  "candidate_count": 5,
+  "usable_candidate_count": 5,
+  "candidates": [
+    {"lag_seconds": -300.0, "pair_count": 19, "correlation": -0.2919, "usable": true, "reason": null},
+    {"lag_seconds": 0.0,    "pair_count": 20, "correlation": 0.2939,  "usable": true, "reason": null},
+    {"lag_seconds": 300.0,  "pair_count": 20, "correlation": 0.7825,  "usable": true, "reason": null},
+    {"lag_seconds": 600.0,  "pair_count": 20, "correlation": 0.9996,  "usable": true, "reason": null},
+    {"lag_seconds": 900.0,  "pair_count": 19, "correlation": 0.7875,  "usable": true, "reason": null}
+  ],
+  "best_lag": 600.0
+}
+```
+
+候选不可用时 `correlation` 为 `null` 且 `reason` 给出原因，例如配对数不足（`"配对数 2 少于 min_pairs=3，未计算相关"`）或某一侧配对值恒定（`"driver 侧配对值方差为零，Pearson 相关未定义"`）；全部候选不可用时 `best_lag` 为 `null`。
 
 ### 内联 JSON 示例
 
@@ -391,6 +453,16 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 趋势扫描复杂度 `O(窗口数 × window_size²)`，建议 `window_size` 控制在数百以内；接口无状态，结果不写入 SQLite。
 
+### 时滞关联扫描算法（`POST /api/v1/lag-correlation`）
+
+1. 两条输入序列各自解析时间戳、按时间排序并拒绝重复时间戳（422）。
+2. 对每个候选时滞 `lag`（秒，可为负），把 driver 时间轴整体平移：`t' = t_driver + lag`。`lag > 0` 表示 driver 的变化在 lag 秒后才体现到 response 上；`lag < 0` 表示 response 领先于 driver。
+3. 在平移后的时间轴上按时间顺序做**贪心一对一最近邻匹配**：依次处理每个平移后的 driver 点，在**未匹配**的 response 点中取时间距离最近且不超过 `match_tolerance_seconds` 的点配对；容差内左右等距时取**较早**的 response；已匹配的 response 点立即锁定、不得复用，找不到容差内点的 driver 直接跳过。
+4. 仅当候选的**配对数 ≥ min_pairs** 且**两侧配对值方差都非零**时，对配对序列 `(driver_value, response_value)` 计算 Pearson 相关系数 `r = Σ(x−x̄)(y−ȳ) / √(Σ(x−x̄)²·Σ(y−ȳ)²)`；否则该候选 `usable=false`、`correlation=null`，并在 `reason` 中说明（配对数不足 / 哪一侧方差为零）。
+5. `best_lag` 在可用候选中依次按 **|correlation| 最大 → 配对数更多 → |lag| 更小 → lag 更小** 选取；无可用候选时为 `null`。
+
+匹配为时间顺序单次扫描的贪心策略（不保证全局最优配对，但确定性强、可解释），整体复杂度约 `O(候选数 × (n_driver + n_response))` 量级；接口无状态，结果不写入 SQLite。
+
 ## 运行测试
 
 ```bash
@@ -398,7 +470,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、趋势扫描（Mann-Kendall 重复值方差修正与连续性校正的量化校验、全同值窗口判平稳、非等距采样下 Theil-Sen 按实际时间差还原斜率、先升后降的方向切换拆分、重叠/首尾相接合并与空档不合并、`min_slope` 过滤）、时滞关联扫描（一对一最近邻匹配的容差边界 / 等距取较早 / 已匹配点不复用、正/负时滞还原、配对数不足与单侧零方差候选标记、`best_lag` 依次按 |corr| → 配对数 → |lag| → lag 决胜、无可用候选时为 null）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`、趋势接口的点数不足 / `window_size < 3` / `step_size < 1` / `alpha` 越界 / `min_slope` 为负 / 重复时间戳，时滞关联接口的空候选 / 非有限时滞或容差 / 负容差 / `min_pairs < 2` / 空序列 / 单侧重复时间戳）。
 
 ## 备注
 

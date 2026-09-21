@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# 有限浮点数（拒绝 NaN / Infinity），用于时滞候选与容差等标量参数
+FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
 
 def parse_timestamp(value: object) -> datetime:
@@ -220,6 +223,69 @@ class TrendResponse(BaseModel):
     trend_segment_count: int = Field(description="合并后的趋势区间数")
     segments: list[TrendSegment]
     windows: list[TrendWindow] | None = None
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class LagCorrelationRequest(BaseModel):
+    """双序列时滞关联扫描请求。"""
+
+    driver_points: list[PointIn] = Field(
+        min_length=1,
+        description="驱动侧序列（时间戳格式与检测接口一致；无需预先排序，拒绝重复时间戳）",
+    )
+    response_points: list[PointIn] = Field(
+        min_length=1,
+        description="响应侧序列（要求同 driver_points）",
+    )
+    lag_seconds: list[FiniteFloat] = Field(
+        min_length=1,
+        max_length=10_000,
+        description=(
+            "候选时滞（秒，可为负）：对每个候选先把 driver 时间平移 +lag，"
+            "再与 response 做一对一最近邻匹配"
+        ),
+    )
+    match_tolerance_seconds: FiniteFloat = Field(
+        ge=0,
+        description="匹配容差（秒）：平移后两侧时间差不超过该值才允许配对",
+    )
+    min_pairs: int = Field(
+        default=3,
+        ge=2,
+        le=1_000_000,
+        description="计算 Pearson 相关所需的最少配对数（不足则该候选不可用）",
+    )
+
+
+class LagCandidateResult(BaseModel):
+    """单个候选时滞的评估结果。"""
+
+    lag_seconds: float = Field(description="候选时滞（秒）")
+    pair_count: int = Field(description="一对一最近邻匹配得到的配对数")
+    correlation: float | None = Field(
+        description="配对序列的 Pearson 相关系数；候选不可用时为 null"
+    )
+    usable: bool = Field(description="该候选是否可用（配对数达标且两侧方差非零）")
+    reason: str | None = Field(description="不可用原因；可用时为 null")
+
+
+class LagCorrelationResponse(BaseModel):
+    driver_point_count: int
+    response_point_count: int
+    match_tolerance_seconds: float
+    min_pairs: int
+    candidate_count: int = Field(description="候选时滞总数")
+    usable_candidate_count: int = Field(description="可用候选数")
+    candidates: list[LagCandidateResult] = Field(
+        description="各候选时滞的评估结果（按请求顺序返回）"
+    )
+    best_lag: float | None = Field(
+        description=(
+            "最优时滞（秒）：可用候选中按 |correlation| 最大、配对数更多、"
+            "|lag| 更小、lag 更小依次确定；无可用候选时为 null"
+        )
+    )
 
     model_config = ConfigDict(extra="ignore")
 

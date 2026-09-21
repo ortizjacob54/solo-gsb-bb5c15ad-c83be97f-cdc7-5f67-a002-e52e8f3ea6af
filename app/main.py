@@ -1,19 +1,27 @@
-"""FastAPI 应用：时间序列异常检测 + 趋势扫描接口。"""
+"""FastAPI 应用：时间序列异常检测 + 趋势扫描 + 双序列时滞关联扫描接口。"""
 
 from __future__ import annotations
 
+import math
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from . import database
 from .detection import analyze_series
+from .lag_correlation import scan_lag_correlation
 from .models import (
     DetectRequest,
     DetectResponse,
     DetectionListResponse,
     HealthResponse,
+    LagCorrelationRequest,
+    LagCorrelationResponse,
     TrendRequest,
     TrendResponse,
     parse_timestamp,
@@ -32,14 +40,42 @@ app = FastAPI(
     description=(
         "接收带时间戳的数值序列：异常检测基于稳健滑动窗口（中位数 + MAD）识别突变，"
         "返回合并后的异常区间、每段基线 / 分数 / 触发点解释，并将结果存入 SQLite；"
-        "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间。"
+        "趋势扫描以滑窗 Mann-Kendall 检验 + Theil-Sen 斜率识别显著上升 / 下降趋势区间；"
+        "时滞关联扫描对 driver / response 双序列按候选时滞平移并做一对一最近邻匹配，"
+        "以 Pearson 相关系数评估各时滞下的关联强度并选出 best_lag。"
     ),
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
 
-def _prepare_series(points: list) -> tuple[list[str], list[float]]:
+def _sanitize_non_finite(obj: Any) -> Any:
+    """递归把校验错误详情中的非有限浮点替换为字符串，保证响应可 JSON 序列化。
+
+    默认的 422 处理会把非法输入值（如 NaN / Infinity）原样回显到错误详情，
+    而严格 JSON 无法序列化这些值，会导致 422 响应本身构造失败。
+    """
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return repr(obj)  # "nan" / "inf" / "-inf"
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_non_finite(v) for v in obj]
+    return obj
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """与默认处理一致返回 422 + detail，但先清洗非有限浮点避免序列化崩溃。"""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(_sanitize_non_finite(exc.errors()))},
+    )
+
+
+def _prepare_series(points: list, label: str = "") -> tuple[list[str], list[float]]:
     """解析时间戳，按时间排序并检查重复。"""
     parsed = []
     for p in points:
@@ -52,7 +88,7 @@ def _prepare_series(points: list) -> tuple[list[str], list[float]]:
     for dt, value in parsed:
         iso = dt.isoformat()
         if timestamps and iso == timestamps[-1]:
-            raise HTTPException(status_code=422, detail=f"存在重复时间戳: {iso}")
+            raise HTTPException(status_code=422, detail=f"{label}存在重复时间戳: {iso}")
         timestamps.append(iso)
         values.append(value)
     return timestamps, values
@@ -149,6 +185,30 @@ def create_trend_scan(req: TrendRequest) -> dict:
     if not req.include_windows:
         body = {k: v for k, v in body.items() if k != "windows"}
     return body
+
+
+@app.post(
+    "/api/v1/lag-correlation",
+    response_model=LagCorrelationResponse,
+    tags=["时滞关联"],
+)
+def create_lag_correlation_scan(req: LagCorrelationRequest) -> dict:
+    """双序列时滞关联扫描：候选时滞平移 + 一对一最近邻匹配 + Pearson 相关
+    （无状态，不入库）。"""
+    driver_ts, driver_values = _prepare_series(req.driver_points, label="driver_points ")
+    response_ts, response_values = _prepare_series(
+        req.response_points, label="response_points "
+    )
+
+    return scan_lag_correlation(
+        driver_timestamps=driver_ts,
+        driver_values=driver_values,
+        response_timestamps=response_ts,
+        response_values=response_values,
+        lag_candidates=req.lag_seconds,
+        match_tolerance_seconds=req.match_tolerance_seconds,
+        min_pairs=req.min_pairs,
+    )
 
 
 @app.get("/health", response_model=HealthResponse, tags=["系统"])
